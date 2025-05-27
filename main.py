@@ -3,16 +3,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score, adjusted_rand_score
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.sql import func
 from scipy.spatial.distance import squareform
 from datetime import datetime
 
-# ---------- DATABASE SETUP ----------
 def get_engine():
     return create_engine(
         f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}@"
@@ -32,9 +30,13 @@ def init_db():
                 silhouette DOUBLE PRECISION
             );
         """))
+        try:
+            conn.execute(text("ALTER TABLE history ADD COLUMN ari DOUBLE PRECISION;"))
+        except Exception as e:
+            if "already exists" not in str(e):
+                raise
         conn.commit()
 
-# ---------- CORE FUNCTIONS ----------
 def generate_base_clusterings(X, n_runs=5):
     base_clusterings = []
     n_clusters_list = []
@@ -91,23 +93,24 @@ def locally_weighted_evidence_accumulation(base_clusterings, n_clusters_list, n_
     Z = linkage(squareform(dist), method='average')
     return fcluster(Z, k, criterion='maxclust') - 1
 
-def save_history(algorithm, theta, k, silhouette):
+def save_history(algorithm, theta, k, silhouette, ari):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO history (algorithm, theta, k, silhouette)
-            VALUES (:algorithm, :theta, :k, :silhouette)
+            INSERT INTO history (algorithm, theta, k, silhouette, ari)
+            VALUES (:algorithm, :theta, :k, :silhouette, :ari)
         """), {
             "algorithm": algorithm,
             "theta": theta,
             "k": k,
-            "silhouette": float(silhouette)
+            "silhouette": float(silhouette),
+            "ari": float(ari) if ari is not None else None
         })
 
 def get_history(limit, offset):
     engine = get_engine()
     query = text("""
-        SELECT id, timestamp, algorithm, theta, k, silhouette
+        SELECT id, timestamp, algorithm, theta, k, silhouette, ari
         FROM history
         ORDER BY timestamp DESC
         LIMIT :limit OFFSET :offset
@@ -115,27 +118,41 @@ def get_history(limit, offset):
     with engine.connect() as conn:
         return pd.read_sql(query, conn, params={"limit": limit, "offset": offset})
 
-# ---------- STREAMLIT APP ----------
 st.set_page_config(layout="wide")
 init_db()
 
-st.sidebar.title("📘 Навигация")
-selected_page = st.sidebar.selectbox("Страница", ["Кластеризация", "История запусков"])
+st.markdown("""
+    <style>
+    h1, h2, h3 {
+        font-weight: 700;
+        font-family: 'Segoe UI', sans-serif;
+    }
+    .stTable tbody tr td {
+        font-size: 14px;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-if selected_page == "Кластеризация":
-    st.title("Locally Weighted Clustering Algorithms")
+st.sidebar.title("Navigation")
+selected_page = st.sidebar.selectbox("Page", ["Clustering", "Run History"])
 
-    st.sidebar.title("⚙️ Настройки кластеризации")
-    algorithm = st.sidebar.radio("Алгоритм", ["Graph Partitioning", "Evidence Accumulation"])
+if selected_page == "Clustering":
+    st.sidebar.title("Clustering Settings")
+
+    algo_choice = st.sidebar.radio("Algorithm", ["Graph", "Evidence"])
+    algo_name_map = {
+        "Graph": "Graph Partitioning",
+        "Evidence": "Evidence Accumulation"
+    }
+    algorithm = algo_name_map[algo_choice]
+
     theta = st.sidebar.slider("θ (theta)", 0.0, 1.0, 0.4, 0.05)
-    k = st.sidebar.slider("Число кластеров (k)", 2, 10, 4)
-
+    k = st.sidebar.slider("Number of clusters (k)", 2, 10, 4)
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📈 Генерация данных")
-    n_samples = st.sidebar.slider("Количество точек", 100, 1000, 300, step=50)
-    data_std = st.sidebar.slider("Шум (std)", 0.1, 3.0, 1.0, 0.1)
-
-    run = st.sidebar.button("🚀 Запустить кластеризацию")
+    st.sidebar.subheader("Data Generator")
+    n_samples = st.sidebar.slider("Number of points", 100, 1000, 300, step=50)
+    data_std = st.sidebar.slider("Noise (std)", 0.1, 3.0, 1.0, 0.1)
+    run = st.sidebar.button("Run Clustering")
 
     if run:
         X = np.random.normal(loc=0, scale=data_std, size=(n_samples, 2))
@@ -150,23 +167,37 @@ if selected_page == "Кластеризация":
         pca = PCA(n_components=2)
         X_pca = pca.fit_transform(X_scaled)
 
-        fig, ax = plt.subplots()
-        ax.scatter(X_pca[:, 0], X_pca[:, 1], c=labels, cmap="viridis")
-        ax.set_title(f"{algorithm} - PCA")
-        st.pyplot(fig)
-
         sil = silhouette_score(X_scaled, labels)
-        st.table(pd.DataFrame([{
-            "Algorithm": algorithm,
-            "Clusters": len(np.unique(labels)),
-            "Silhouette Score": sil
-        }]))
+        ari = adjusted_rand_score(base_clusterings[0], labels) if base_clusterings else None
 
-        save_history(algorithm, theta, k, sil)
+        st.title("Locally Weighted Clustering Algorithms")
+        st.subheader(algorithm)
 
-elif selected_page == "История запусков":
-    st.title("🕓 История запусков")
-    page = st.number_input("Страница", min_value=1, step=1, value=1)
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            fig, ax = plt.subplots(figsize=(3, 2.5), dpi=120)
+            ax.scatter(X_pca[:, 0], X_pca[:, 1], c=labels, cmap="viridis", s=6)
+            ax.set_title("PCA", fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_facecolor("white")
+            fig.tight_layout(pad=0.5)
+            st.pyplot(fig, clear_figure=True)
+
+        metrics = {
+            "Number of Clusters (k)": k,
+            "Silhouette Score": f"{sil:.4f}",
+            "ARI Score": f"{ari:.4f}"
+        }
+        metrics_table = pd.DataFrame(metrics.items(), columns=["Metric", "Value"])
+        st.markdown("### Clustering Metrics")
+        st.table(metrics_table)
+
+        save_history(algorithm, theta, k, sil, ari)
+
+elif selected_page == "Run History":
+    st.title("Run History")
+    page = st.number_input("Page", min_value=1, step=1, value=1)
     page_size = 5
     offset = (page - 1) * page_size
     history_df = get_history(limit=page_size, offset=offset)
