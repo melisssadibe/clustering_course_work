@@ -338,7 +338,7 @@ if selected_page == "Clustering":
         sil = silhouette_score(X_scaled, labels)
         ari = adjusted_rand_score(np.zeros_like(labels), labels)
 
-        st.title("Locally Weighted Clustering Algorithms")
+        st.title("Consensus Clustering Algorithms")
         st.subheader(algorithm)
 
         col1, col2 = st.columns([1, 3])
